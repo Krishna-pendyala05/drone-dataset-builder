@@ -78,8 +78,24 @@ def _normalize_key(raw: str) -> str:
     return cleaned.replace(" ", "_")
 
 
-def _coerce_number(value: str) -> Optional[float]:
-    match = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", value.replace(",", ""))
+def _normalize_placeholder(value: object) -> Optional[object]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed == "":
+            return None
+        lowered = trimmed.lower()
+        if lowered in {"—", "n/a", "na", "-", "–"}:
+            return None
+    return value
+
+
+def _coerce_number(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value)
+    match = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", text.replace(",", ""))
     if match:
         try:
             return float(match.group(1))
@@ -169,18 +185,19 @@ def _cast_fields(kv: Dict[str, str], markdown: str, url: str) -> Dict[str, objec
     fields: Dict[str, object] = {}
     for raw_key, raw_val in kv.items():
         normalized_key = _normalize_key(raw_key)
-        value = raw_val
+        normalized_value = _normalize_placeholder(raw_val)
+        value = normalized_value
         if normalized_key in {"max_flight_time", "payload_capacity", "max_speed"}:
             number = _coerce_number(value)
-            fields[normalized_key] = number if number is not None else value
+            fields[normalized_key] = number
         elif normalized_key in {"gimbal", "supports_hd_link", "thermal_capability"}:
-            bool_val = _coerce_bool(value)
-            fields[normalized_key] = bool_val if bool_val is not None else value
+            bool_val = _coerce_bool(value if isinstance(value, str) else str(value))
+            fields[normalized_key] = bool_val if bool_val is not None else _normalize_placeholder(value)
         elif normalized_key in {"video_tx_power_mw"}:
             num = _coerce_number(value)
-            fields[normalized_key] = int(num) if num is not None else value
+            fields[normalized_key] = int(num) if num is not None else _normalize_placeholder(value)
         else:
-            fields[normalized_key] = value
+            fields[normalized_key] = _normalize_placeholder(value)
     if "brand" not in fields:
         heading_match = re.search(r"^#+\s*(.+)$", markdown, flags=re.MULTILINE)
         if heading_match:
@@ -211,7 +228,7 @@ def deterministic_parser_factory(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM mapper failed; continuing with deterministic fields", exc_info=exc)
         drone = _to_schema(fields)
-        return drone.json()
+        return drone.model_dump_json()
 
     return parser
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable, Dict
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 
 from agents import crawler
 from config.schemas import CameraDrone, EnterpriseDrone, FPVDrone
@@ -56,7 +57,7 @@ async def test_extract_with_self_healing_parses_categories_and_brand_model(
     markdown_payload = _load_fixture(markdown_fixture)
     expected_json = _load_expected(expected_fixture)
 
-    async def fake_fetch_markdown(target_url: str) -> str:
+    async def fake_fetch_markdown(target_url: str, **_kwargs) -> str:
         assert target_url == url
         return markdown_payload
 
@@ -84,7 +85,7 @@ async def test_extract_with_self_healing_invokes_lookup_strategy(monkeypatch: py
     primary_md = _load_fixture("camera.md")
     fallback_md = _load_fixture("enterprise.md")
 
-    async def fake_fetch_markdown(target_url: str) -> str:
+    async def fake_fetch_markdown(target_url: str, **_kwargs) -> str:
         if target_url == primary_url:
             return primary_md
         if target_url == alt_url:
@@ -136,3 +137,40 @@ async def test_extract_with_self_healing_invokes_lookup_strategy(monkeypatch: py
     assert result.parsed.model == "Aero X"
     assert result.parsed.category == "camera"
     assert result.metadata["healed"] is True
+
+
+@pytest.mark.asyncio
+async def test_safe_evaluate_recovers_after_context_destruction(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"evaluate": 0, "load": 0, "timeout": 0}
+
+    class DummyMouse:
+        async def wheel(self, *_args, **_kwargs):
+            return None
+
+    class DummyKeyboard:
+        async def press(self, *_args, **_kwargs):
+            return None
+
+    class DummyPage:
+        mouse = DummyMouse()
+        keyboard = DummyKeyboard()
+
+        async def wait_for_load_state(self, *_args, **_kwargs):
+            calls["load"] += 1
+            return None
+
+        async def wait_for_timeout(self, *_args, **_kwargs):
+            calls["timeout"] += 1
+            return None
+
+        async def evaluate(self, *_args, **_kwargs):
+            calls["evaluate"] += 1
+            if calls["evaluate"] == 1:
+                raise PlaywrightError("Execution context was destroyed, retry")
+            return {"ok": True}
+
+    page = DummyPage()
+    result = await crawler._safe_evaluate(page, "(sel) => sel", ["a"], timeout_ms=1000)  # type: ignore[attr-defined]
+
+    assert result == {"ok": True}
+    assert calls["evaluate"] == 2

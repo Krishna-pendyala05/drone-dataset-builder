@@ -23,7 +23,7 @@ async def test_build_dataset_writes_jsonl(monkeypatch: pytest.MonkeyPatch, tmp_p
         "https://example.com/fpv": (FIXTURE_DIR / "fpv.md").read_text(encoding="utf-8"),
     }
 
-    async def fake_fetch_markdown(url: str) -> str:
+    async def fake_fetch_markdown(url: str, **_kwargs) -> str:
         return markdown_map[url]
 
     monkeypatch.setattr(crawler, "fetch_markdown", fake_fetch_markdown)
