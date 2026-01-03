@@ -1,0 +1,2 @@
+https://example.com/camera
+https://example.com/fpv

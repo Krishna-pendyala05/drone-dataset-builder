@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import logging
+from pathlib import Path
+from typing import Callable, Iterable, List, Optional
+
+from agents.crawler import CrawlResult, extract_with_self_healing
+from agents.parser import deterministic_parser_factory
+
+logger = logging.getLogger(__name__)
+
+
+def _load_urls(path: Path) -> List[str]:
+    urls: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        urls.append(trimmed)
+    return urls
+
+
+def _load_llm_mapper(path: Optional[str]) -> Optional[Callable]:
+    if not path:
+        return None
+    if ":" not in path:
+        raise ValueError("LLM mapper must be in the form module:function")
+    module_name, func_name = path.split(":", 1)
+    module = importlib.import_module(module_name)
+    mapper = getattr(module, func_name, None)
+    if not callable(mapper):
+        raise ValueError(f"{path} is not callable")
+    return mapper
+
+
+async def build_dataset(
+    seeds_path: Path,
+    output_path: Path,
+    llm_mapper: Optional[Callable] = None,
+    max_attempts: int = 2,
+) -> Path:
+    urls = _load_urls(seeds_path)
+    parser = deterministic_parser_factory(llm_mapper=llm_mapper)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    records = 0
+
+    with output_path.open("w", encoding="utf-8") as outfile:
+        for url in urls:
+            result: CrawlResult = await extract_with_self_healing(
+                url,
+                parser=parser,
+                lookup_strategy=None,
+                max_attempts=max_attempts,
+            )
+            if result.parsed is None:
+                logger.error("crawl.skipped", extra={"url": url, "errors": result.metadata.get("errors")})
+                continue
+            payload = {
+                "url": url,
+                "data": result.parsed.dict(),
+                "metadata": result.metadata,
+            }
+            outfile.write(json.dumps(payload) + "\n")
+            records += 1
+            logger.info("crawl.success", extra={"url": url})
+
+    logger.info("dataset.completed", extra={"output": str(output_path), "records": records})
+    return output_path
+
+
+def parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Drone spec dataset generator")
+    parser.add_argument("--seeds", required=True, help="Path to seeds file (one URL per line).")
+    parser.add_argument(
+        "--output",
+        default="dataset.jsonl",
+        help="Output JSONL path (default: dataset.jsonl)",
+    )
+    parser.add_argument(
+        "--llm-mapper",
+        default=None,
+        help="Optional module:function to post-process deterministic fields with an LLM.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum crawl attempts per URL before failing.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
+    return parser.parse_args(args=args)
+
+
+def main(argv: Optional[Iterable[str]] = None) -> None:
+    args = parse_args(argv)
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(message)s")
+    llm_mapper = _load_llm_mapper(args.llm_mapper)
+    output_path = Path(args.output)
+    seeds_path = Path(args.seeds)
+
+    import asyncio
+
+    asyncio.run(
+        build_dataset(
+            seeds_path=seeds_path,
+            output_path=output_path,
+            llm_mapper=llm_mapper,
+            max_attempts=args.max_attempts,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
