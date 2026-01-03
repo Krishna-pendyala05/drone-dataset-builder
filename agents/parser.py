@@ -5,6 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from config.schemas import CameraDrone, DroneBase, EnterpriseDrone, FPVDrone
 
@@ -30,29 +31,26 @@ class ParsedFields:
     operating_temp_c: Optional[str] = None
 
 
-KEY_MAP: Dict[str, str] = {
-    "brand": "brand",
-    "manufacturer": "brand",
-    "maker": "brand",
-    "model": "model",
-    "name": "model",
-    "product": "model",
+SPEC_KEY_MAP: Dict[str, str] = {
+    # Core specs
     "flight time": "max_flight_time",
     "endurance": "max_flight_time",
     "hover time": "max_flight_time",
     "max flight time": "max_flight_time",
     "maximum flight time": "max_flight_time",
+    "max endurance": "max_flight_time",
     "sensor": "sensor_type",
-    "camera": "sensor_type",
-    "payload sensor": "sensor_type",
+    "sensor type": "sensor_type",
+    "camera sensor": "sensor_type",
     "imager": "sensor_type",
+    "max speed": "max_speed",
+    "top speed": "max_speed",
+    "speed": "max_speed",
+    # Payload and extras
     "payload": "payload_capacity",
     "max payload": "payload_capacity",
     "payload weight": "payload_capacity",
     "maximum payload": "payload_capacity",
-    "max speed": "max_speed",
-    "top speed": "max_speed",
-    "speed": "max_speed",
     "gimbal": "gimbal",
     "camera resolution": "camera_resolution",
     "resolution": "camera_resolution",
@@ -68,14 +66,28 @@ KEY_MAP: Dict[str, str] = {
     "operating temperature": "operating_temp_c",
 }
 
+IDENTITY_KEYS: Dict[str, str] = {
+    "brand": "brand",
+    "manufacturer": "brand",
+    "maker": "brand",
+    "model": "model",
+    "name": "model",
+    "product": "model",
+}
 
-def _normalize_key(raw: str) -> str:
+MIN_FIELD_COUNT = 5
+
+
+def _normalize_key(raw: str) -> Optional[str]:
     lowered = raw.strip().lower().replace("\uff1a", ":")
-    cleaned = re.sub(r"[\\*`_]", "", lowered).strip(" :")
-    for key in sorted(KEY_MAP, key=len, reverse=True):
-        if key in cleaned:
-            return KEY_MAP[key]
-    return cleaned.replace(" ", "_")
+    cleaned = re.sub(r"[\\*`]", "", lowered).strip(" :")
+    normalized = cleaned.replace("_", " ")
+    for key in sorted({**SPEC_KEY_MAP, **IDENTITY_KEYS}, key=len, reverse=True):
+        if key in normalized:
+            return ({**SPEC_KEY_MAP, **IDENTITY_KEYS})[key]
+    if normalized in {"brand", "model"}:
+        return cleaned
+    return None
 
 
 def _normalize_placeholder(value: object) -> Optional[object]:
@@ -175,39 +187,118 @@ def _parse_key_values(lines: Iterable[str]) -> Dict[str, str]:
 def _collapse_tables(tables: List[Dict[str, str]]) -> Dict[str, str]:
     kv: Dict[str, str] = {}
     for row in tables:
+        if len(row) == 2:
+            first_key, second_key = list(row.keys())
+            raw_key_candidate = row[first_key]
+            raw_value_candidate = row[second_key]
+            normalized_key = _normalize_key(raw_key_candidate)
+            if normalized_key:
+                kv.setdefault(normalized_key, raw_value_candidate)
+                continue
         for key, value in row.items():
-            clean_key = _normalize_key(key)
-            kv.setdefault(clean_key, value)
+            normalized_key = _normalize_key(key)
+            if normalized_key:
+                kv.setdefault(normalized_key, value)
     return kv
 
 
-def _cast_fields(kv: Dict[str, str], markdown: str, url: str) -> Dict[str, object]:
+def _filter_lines(lines: List[str]) -> List[str]:
+    filtered: List[str] = []
+    for line in lines:
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        link_only = re.fullmatch(r"[-*]?\s*\[.+\]\(.+\)", trimmed)
+        if link_only:
+            continue
+        if "Suggested searches" in trimmed or trimmed.lower().startswith("support"):
+            continue
+        filtered.append(line)
+    return filtered
+
+
+def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
+    lines = [line for line in markdown.splitlines()]
+    sections: List[Tuple[int, str]] = []
+    for idx, line in enumerate(lines):
+        heading_match = re.match(r"^(#+)\s*(.+)$", line.strip())
+        if heading_match:
+            sections.append((idx, heading_match.group(2).strip()))
+    spec_indices: List[int] = []
+    for idx, title in sections:
+        lowered = title.lower()
+        if "spec" in lowered:
+            spec_indices.append(idx)
+    if not spec_indices:
+        for idx, line in enumerate(lines):
+            if "#spec" in line.lower() or "anchor=\"spec" in line.lower():
+                spec_indices.append(idx)
+                break
+    if not spec_indices:
+        return _filter_lines(lines), {"spec_section_found": False, "section_title": None}
+    start = min(spec_indices)
+    next_headings = [idx for idx, _ in sections if idx > start]
+    end = min(next_headings) if next_headings else len(lines)
+    return _filter_lines(lines[start:end]), {
+        "spec_section_found": True,
+        "section_title": lines[start].lstrip("# ").strip() if start < len(lines) else None,
+    }
+
+
+def _map_fields(kv: Dict[str, str]) -> Tuple[Dict[str, object], Dict[str, str]]:
     fields: Dict[str, object] = {}
+    unmapped: Dict[str, str] = {}
     for raw_key, raw_val in kv.items():
         normalized_key = _normalize_key(raw_key)
         normalized_value = _normalize_placeholder(raw_val)
-        value = normalized_value
+        if normalized_key is None or normalized_value is None:
+            if raw_key.strip():
+                unmapped[raw_key.strip()] = raw_val
+            continue
+        if isinstance(normalized_value, str) and re.search(r"(https?:|www\\.|//)", normalized_value, re.IGNORECASE):
+            if normalized_key != "link":
+                unmapped[raw_key.strip()] = raw_val
+                continue
         if normalized_key in {"max_flight_time", "payload_capacity", "max_speed"}:
-            number = _coerce_number(value)
+            number = _coerce_number(normalized_value)
             fields[normalized_key] = number
         elif normalized_key in {"gimbal", "supports_hd_link", "thermal_capability"}:
-            bool_val = _coerce_bool(value if isinstance(value, str) else str(value))
-            fields[normalized_key] = bool_val if bool_val is not None else _normalize_placeholder(value)
+            bool_val = _coerce_bool(normalized_value if isinstance(normalized_value, str) else str(normalized_value))
+            fields[normalized_key] = bool_val if bool_val is not None else _normalize_placeholder(normalized_value)
         elif normalized_key in {"video_tx_power_mw"}:
-            num = _coerce_number(value)
-            fields[normalized_key] = int(num) if num is not None else _normalize_placeholder(value)
+            num = _coerce_number(normalized_value)
+            fields[normalized_key] = int(num) if num is not None else _normalize_placeholder(normalized_value)
         else:
-            fields[normalized_key] = _normalize_placeholder(value)
-    if "brand" not in fields:
-        heading_match = re.search(r"^#+\s*(.+)$", markdown, flags=re.MULTILINE)
-        if heading_match:
-            parts = heading_match.group(1).split(" ", 1)
-            if len(parts) == 2:
-                fields["brand"] = parts[0]
-                fields.setdefault("model", parts[1])
+            fields[normalized_key] = _normalize_placeholder(normalized_value)
+    return fields, unmapped
+
+
+def _derive_identity(fields: Dict[str, object], markdown: str, url: str) -> None:
+    url_host = urlsplit(url).netloc.lower()
+    if "dji.com" in url_host:
+        fields["brand"] = "DJI"
+    heading_match = re.search(r"^#\s*(.+)$", markdown, flags=re.MULTILINE)
+    title = heading_match.group(1).strip() if heading_match else None
+    if not title:
+        secondary_heading = re.search(r"^##\s*(.+)$", markdown, flags=re.MULTILINE)
+        if secondary_heading:
+            title = secondary_heading.group(1).strip()
+    if title and "spec" not in title.lower():
+        brand_prefix = str(fields.get("brand", "") or "")
+        model_candidate = title
+        if brand_prefix and model_candidate.lower().startswith(brand_prefix.lower()):
+            model_candidate = model_candidate[len(brand_prefix) :].strip(" -|")
+        if model_candidate:
+            fields.setdefault("model", model_candidate)
+    if "model" not in fields or not fields["model"]:
+        path_parts = [part for part in urlsplit(url).path.split("/") if part]
+        slug = path_parts[-1] if path_parts else ""
+        normalized_slug = slug.replace("-", " ").replace("_", " ").strip()
+        if normalized_slug:
+            words = [word.upper() if word.isupper() else word.capitalize() for word in normalized_slug.split()]
+            fields.setdefault("model", " ".join(words))
     fields["category"] = _maybe_category(fields, markdown)
     fields.setdefault("link", url)
-    return fields
 
 
 def deterministic_parser_factory(
@@ -215,11 +306,12 @@ def deterministic_parser_factory(
 ) -> Callable[[str, str], str]:
     def parser(prompt: str, url: str) -> str:
         markdown = _extract_markdown(prompt)
-        lines = [line for line in markdown.splitlines() if line.strip()]
-        tables = _parse_table(lines)
+        spec_lines, section_info = _select_spec_section(markdown)
+        tables = _parse_table(spec_lines)
         table_kv = _collapse_tables(tables)
-        kv = {**table_kv, **_parse_key_values(lines)}
-        fields = _cast_fields(kv, markdown, url)
+        kv = {**table_kv, **_parse_key_values(spec_lines)}
+        fields, unmapped = _map_fields(kv)
+        _derive_identity(fields, markdown, url)
         if llm_mapper:
             try:
                 mapped = llm_mapper(fields, markdown, url)
@@ -228,7 +320,12 @@ def deterministic_parser_factory(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM mapper failed; continuing with deterministic fields", exc_info=exc)
         drone = _to_schema(fields)
-        return drone.model_dump_json()
+        metadata = {
+            "unmapped_specs": unmapped,
+            "mapped_fields": sorted([key for key, value in fields.items() if value is not None]),
+            **section_info,
+        }
+        return json.dumps({"data": drone.dict(), "metadata": metadata})
 
     return parser
 
@@ -244,4 +341,5 @@ def _to_schema(fields: Dict[str, object]) -> DroneBase:
 
 __all__ = [
     "deterministic_parser_factory",
+    "MIN_FIELD_COUNT",
 ]

@@ -174,3 +174,32 @@ async def test_safe_evaluate_recovers_after_context_destruction(monkeypatch: pyt
 
     assert result == {"ok": True}
     assert calls["evaluate"] == 2
+
+
+@pytest.mark.asyncio
+async def test_extract_with_self_healing_rejects_invalid_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    url = "https://www.dji.com/global/fake"
+
+    async def fake_fetch_markdown(target_url: str, **_kwargs) -> str:
+        assert target_url == url
+        return "## Placeholder content"
+
+    def stub_parser(prompt: str, target_url: str) -> str:
+        assert target_url == url
+        payload = {
+            "brand": "OtherBrand",
+            "model": "x",
+            "category": "camera",
+            "max_flight_time": None,
+            "max_speed": None,
+            "link": target_url,
+        }
+        return json.dumps(payload)
+
+    monkeypatch.setattr(crawler, "fetch_markdown", fake_fetch_markdown)
+
+    result = await crawler.extract_with_self_healing(url, parser=stub_parser, max_attempts=1)
+
+    assert result.parsed is None
+    assert result.metadata.get("invalid") is True
+    assert "brand_mismatch_for_domain" in result.metadata.get("reason", "")
