@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional
 
-from agents.crawler import CrawlResult, extract_with_self_healing
+from agents.crawler import DEFAULT_TIMEOUT_MS, CrawlResult, extract_with_self_healing
 from agents.parser import deterministic_parser_factory
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ async def build_dataset(
     output_path: Path,
     llm_mapper: Optional[Callable] = None,
     max_attempts: int = 2,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> Path:
     urls = _load_urls(seeds_path)
     parser = deterministic_parser_factory(llm_mapper=llm_mapper)
@@ -58,6 +59,7 @@ async def build_dataset(
                 parser=parser,
                 lookup_strategy=None,
                 max_attempts=max_attempts,
+                timeout_ms=timeout_ms,
             )
             if result.parsed is None:
                 failed_count += 1
@@ -73,7 +75,7 @@ async def build_dataset(
                 continue
             payload = {
                 "url": url,
-                "data": result.parsed.dict(),
+                "data": result.parsed.model_dump(),
                 "metadata": result.metadata,
             }
             outfile.write(json.dumps(payload) + "\n")
@@ -124,6 +126,12 @@ def parse_args(args: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Maximum crawl attempts per URL before failing.",
     )
     parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=DEFAULT_TIMEOUT_MS,
+        help="Navigation and load timeout in milliseconds (default: 90000).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ERROR).",
@@ -146,6 +154,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             output_path=output_path,
             llm_mapper=llm_mapper,
             max_attempts=args.max_attempts,
+            timeout_ms=args.timeout_ms,
         )
     )
 

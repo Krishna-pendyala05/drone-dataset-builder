@@ -38,3 +38,13 @@ def test_deterministic_parser_respects_llm_mapper_override() -> None:
 
     assert result["brand"] == "LLMBrand"
     assert result["model"] == "Bar"
+
+
+def test_deterministic_parser_normalizes_empty_numeric_fields() -> None:
+    markdown = "- Brand: SkyCam\n- Model: EmptySpeed\n- Max speed: —\n"
+    parser = deterministic_parser_factory()
+
+    result = json.loads(parser(markdown, "https://example.com/empty-speed"))
+    drone = CameraDrone(**result)
+
+    assert drone.max_speed is None

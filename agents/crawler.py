@@ -4,15 +4,24 @@ import asyncio
 import importlib.util
 import json
 import logging
-from time import perf_counter
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from config.schemas import CameraDrone, DroneBase, EnterpriseDrone, FPVDrone
 from agents.parser import deterministic_parser_factory
+
+DEFAULT_TIMEOUT_MS = 90000
+
+
+class CrawlContentError(RuntimeError):
+    def __init__(self, message: str, markdown_snapshot: str | None = None):
+        super().__init__(message)
+        self.markdown_snapshot = markdown_snapshot or ""
 
 # Optional Markdown conversion helper. If markdownify is not installed the
 # fallback will still produce a readable, Markdown-compatible string.
@@ -72,11 +81,12 @@ Markdown payload:
 async def _deep_wait(page, timeout_ms: int = 12000) -> None:
     """Wait for JS-rendered spec tables, including Shadow DOM content."""
 
-    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
     await page.wait_for_timeout(600)
 
     async def has_shadow_tables(selectors: Sequence[str]) -> bool:
-        return await page.evaluate(
+        return await _safe_evaluate(
+            page,
             """
             (selectors) => {
               const seen = [];
@@ -96,6 +106,7 @@ async def _deep_wait(page, timeout_ms: int = 12000) -> None:
             }
             """,
             list(selectors),
+            timeout_ms=timeout_ms,
         )
 
     deadline = timeout_ms
@@ -108,33 +119,78 @@ async def _deep_wait(page, timeout_ms: int = 12000) -> None:
         elapsed += interval
 
     # Final attempt to ensure content is hydrated.
-    await page.wait_for_load_state("networkidle")
+    await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+
+async def _wait_for_settled(page, timeout_ms: int) -> None:
+    await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    await page.wait_for_load_state("networkidle", timeout=timeout_ms)
+
+
+async def _safe_evaluate(page, script: str, *args, timeout_ms: int) -> Any:
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        try:
+            await _wait_for_settled(page, timeout_ms=timeout_ms)
+            return await page.evaluate(script, *args)
+        except PlaywrightError as exc:
+            message = str(exc)
+            destroyed = "Execution context was destroyed" in message
+            if destroyed and attempts < 2:
+                await page.wait_for_timeout(300)
+                continue
+            raise
+
+
+async def _progressive_scroll(page, timeout_ms: int) -> None:
+    """Scroll using Playwright primitives to trigger lazy loading without brittle eval."""
+
+    _ = timeout_ms
+    for _ in range(6):
+        await page.mouse.wheel(0, 1600)
+        await page.wait_for_timeout(250)
+    for _ in range(2):
+        await page.keyboard.press("End")
+        await page.wait_for_timeout(250)
 
 
 async def fetch_markdown(
     url: str,
     wait_selectors: Iterable[str] = SHADOW_PROBES,
     viewport: Tuple[int, int] = (1400, 900),
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> str:
     """Navigate with Playwright and capture the page as Markdown after deep waits."""
 
+    logger = logging.getLogger(__name__)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": viewport[0], "height": viewport[1]})
         html = ""
-        await page.goto(url, wait_until="domcontentloaded")
         try:
-            await _deep_wait(page)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await _wait_for_settled(page, timeout_ms=timeout_ms)
+            await _progressive_scroll(page, timeout_ms=timeout_ms)
+            await _deep_wait(page, timeout_ms=timeout_ms)
             for selector in wait_selectors:
                 try:
                     await page.wait_for_selector(selector, state="visible", timeout=2000)
                 except PlaywrightTimeoutError:
                     continue
-        finally:
             html = await page.content()
+            return html_to_markdown(html)
+        except Exception as exc:  # noqa: BLE001
+            if not html:
+                try:
+                    html = await page.content()
+                except Exception:  # noqa: BLE001
+                    html = ""
+            markdown_snapshot = html_to_markdown(html) if html else ""
+            logger.warning("crawl.partial_capture url=%s error=%s", url, exc)
+            raise CrawlContentError(str(exc), markdown_snapshot=markdown_snapshot) from exc
+        finally:
             await browser.close()
-
-    return html_to_markdown(html)
 
 
 def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> DroneBase:
@@ -163,6 +219,7 @@ async def extract_with_self_healing(
     parser: MarkdownParser,
     lookup_strategy: Optional[SearchStrategy] = None,
     max_attempts: int = 2,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> CrawlResult:
     """
     Crawl, parse, and self-heal missing critical fields.
@@ -183,7 +240,7 @@ async def extract_with_self_healing(
         attempt_start = perf_counter()
         logger.info("crawl.start url=%s attempt=%s", url, attempts)
         try:
-            markdown = await fetch_markdown(url)
+            markdown = await fetch_markdown(url, timeout_ms=timeout_ms)
             parsed = parse_with_agent(markdown, url, parser)
             attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
             total_elapsed_ms += attempt_elapsed_ms
@@ -192,8 +249,13 @@ async def extract_with_self_healing(
             attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
             total_elapsed_ms += attempt_elapsed_ms
             error_text = f"{type(exc).__name__}: {exc}"
+            metadata_partial = isinstance(exc, CrawlContentError)
+            if metadata_partial and isinstance(exc, CrawlContentError) and exc.markdown_snapshot:
+                markdown = exc.markdown_snapshot
+            log_action = "crawl.partial_success" if metadata_partial else "crawl.failed"
             logger.warning(
-                "crawl.failed url=%s attempt=%s elapsed_ms=%s error=%s",
+                "%s url=%s attempt=%s elapsed_ms=%s error=%s",
+                log_action,
                 url,
                 attempts,
                 attempt_elapsed_ms,
@@ -209,14 +271,20 @@ async def extract_with_self_healing(
             url=url,
             markdown=markdown,
             parsed=None,
-            metadata={"healed": False, "attempts": attempts, "errors": errors, "total_elapsed_ms": total_elapsed_ms},
+            metadata={
+                "healed": False,
+                "attempts": attempts,
+                "errors": errors,
+                "total_elapsed_ms": total_elapsed_ms,
+                "partial": bool(markdown),
+            },
         )
 
     missing_core = [field for field in ("brand", "model") if not getattr(parsed, field)]
     healed = False
     if missing_core and lookup_strategy:
         for field in missing_core:
-            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.dict()})
+            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.model_dump()})
             if not alt_url:
                 continue
             logger.info("heal.lookup", extra={"field": field, "url": url, "alt_url": alt_url})
@@ -236,6 +304,7 @@ async def extract_with_self_healing(
             "attempts": attempts,
             "errors": errors,
             "total_elapsed_ms": total_elapsed_ms,
+            "partial": bool(errors),
         },
     )
 
@@ -261,9 +330,11 @@ def run_sample():
 
 
 __all__ = [
+    "DEFAULT_TIMEOUT_MS",
     "CrawlResult",
     "fetch_markdown",
     "parse_with_agent",
     "extract_with_self_healing",
+    "CrawlContentError",
     "run_sample",
 ]

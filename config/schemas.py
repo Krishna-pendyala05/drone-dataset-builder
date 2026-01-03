@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, ConfigDict, Field, validator
 
 
 class DroneBase(BaseModel):
@@ -40,9 +40,7 @@ class DroneBase(BaseModel):
             return value.strip() or None
         return value
 
-    class Config:
-        anystr_strip_whitespace = True
-        validate_assignment = True
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
 
 
 class CameraDrone(DroneBase):
@@ -76,4 +74,3 @@ class EnterpriseDrone(DroneBase):
     operating_temp_c: Optional[str] = Field(
         None, description="Operating temperature range in °C."
     )
-
