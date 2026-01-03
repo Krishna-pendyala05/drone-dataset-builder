@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
 
@@ -10,6 +11,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from config.schemas import CameraDrone, DroneBase, EnterpriseDrone, FPVDrone
+from agents.parser import deterministic_parser_factory
 
 # Optional Markdown conversion helper. If markdownify is not installed the
 # fallback will still produce a readable, Markdown-compatible string.
@@ -139,7 +141,10 @@ def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> DroneBa
 
     prompt = _mapping_prompt(markdown)
     raw_response = parser(prompt, url)
-    payload = json.loads(raw_response)
+    try:
+        payload = json.loads(raw_response)
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+        raise ValueError(f"Parser returned invalid JSON for {url}") from exc
 
     link = payload.get("link") or url
     payload.pop("link", None)
@@ -156,6 +161,7 @@ async def extract_with_self_healing(
     url: str,
     parser: MarkdownParser,
     lookup_strategy: Optional[SearchStrategy] = None,
+    max_attempts: int = 2,
 ) -> CrawlResult:
     """
     Crawl, parse, and self-heal missing critical fields.
@@ -164,21 +170,58 @@ async def extract_with_self_healing(
     provided lookup_strategy to locate an alternative URL.
     """
 
-    markdown = await fetch_markdown(url)
-    parsed = parse_with_agent(markdown, url, parser)
+    logger = logging.getLogger(__name__)
+    attempts = 0
+    errors = []
+    markdown = ""
+    parsed: Optional[DroneBase] = None
+
+    while attempts < max_attempts and parsed is None:
+        attempts += 1
+        logger.info("crawl.start", extra={"url": url, "attempt": attempts})
+        try:
+            markdown = await fetch_markdown(url)
+            parsed = parse_with_agent(markdown, url, parser)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("crawl.failed", extra={"url": url, "attempt": attempts, "error": str(exc)})
+            errors.append(str(exc))
+            if attempts >= max_attempts:
+                break
+            continue
+
+    if parsed is None:
+        return CrawlResult(
+            url=url,
+            markdown=markdown,
+            parsed=None,
+            metadata={"healed": False, "attempts": attempts, "errors": errors},
+        )
 
     missing_core = [field for field in ("brand", "model") if not getattr(parsed, field)]
+    healed = False
     if missing_core and lookup_strategy:
         for field in missing_core:
             alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.dict()})
             if not alt_url:
                 continue
+            logger.info("heal.lookup", extra={"field": field, "url": url, "alt_url": alt_url})
             alt_markdown = await fetch_markdown(alt_url)
             alt_parsed = parse_with_agent(alt_markdown, alt_url, parser)
             if getattr(parsed, field) is None and getattr(alt_parsed, field):
                 setattr(parsed, field, getattr(alt_parsed, field))
+                healed = True
 
-    return CrawlResult(url=url, markdown=markdown, parsed=parsed, metadata={"healed": bool(missing_core)})
+    return CrawlResult(
+        url=url,
+        markdown=markdown,
+        parsed=parsed,
+        metadata={
+            "healed": healed or bool(missing_core),
+            "missing_fields": missing_core,
+            "attempts": attempts,
+            "errors": errors,
+        },
+    )
 
 
 def run_sample():
@@ -189,23 +232,11 @@ def run_sample():
     """
 
     async def _runner():
-        def fake_parser(prompt: str, url: str) -> str:  # noqa: ANN001
-            # Mock parser for demonstration; replace with an LLM call.
-            return json.dumps(
-                {
-                    "brand": "DemoBrand",
-                    "model": "DemoModel",
-                    "category": "camera",
-                    "max_flight_time": 34,
-                    "sensor_type": "1\" CMOS",
-                    "payload_capacity": 0.3,
-                    "link": url,
-                }
-            )
+        deterministic_parser = deterministic_parser_factory()
 
         result = await extract_with_self_healing(
             "https://example.com/drone",
-            parser=fake_parser,
+            parser=deterministic_parser,
             lookup_strategy=lambda field, ctx: ctx["url"],
         )
         return result
