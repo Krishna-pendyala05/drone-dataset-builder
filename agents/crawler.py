@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
@@ -13,7 +14,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
 from config.schemas import CameraDrone, DroneBase, EnterpriseDrone, FPVDrone
-from agents.parser import deterministic_parser_factory
+from agents.parser import MIN_FIELD_COUNT, deterministic_parser_factory
 
 DEFAULT_TIMEOUT_MS = 90000
 
@@ -53,6 +54,35 @@ SHADOW_PROBES: Tuple[str, ...] = (
     "specs-table",
     "specification-table",
 )
+
+
+def _validate_result(parsed: DroneBase, url: str, parser_metadata: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    meta: Dict[str, Any] = {"parser_metadata": parser_metadata}
+    reasons = []
+    fields = parsed.dict()
+    host = ""
+    try:
+        from urllib.parse import urlsplit
+
+        host = urlsplit(url).netloc.lower()
+    except Exception:  # noqa: BLE001
+        host = ""
+    if "dji.com" in host and (parsed.brand or "").strip().upper() != "DJI":
+        reasons.append("brand_mismatch_for_domain")
+    model = parsed.model or ""
+    if len(model.strip()) < 2 or re.search(r"(https?:|//)", model, flags=re.IGNORECASE):
+        reasons.append("invalid_model")
+    field_count = sum(1 for _, value in fields.items() if value not in (None, ""))
+    meta["field_count"] = field_count
+    if field_count < MIN_FIELD_COUNT:
+        reasons.append("insufficient_fields")
+    if fields.get("max_flight_time") is None and fields.get("max_speed") is None:
+        reasons.append("missing_core_metrics")
+    if reasons:
+        meta["invalid"] = True
+        meta["reason"] = ";".join(reasons)
+        return False, meta
+    return True, meta
 
 
 def _mapping_prompt(markdown: str) -> str:
@@ -155,6 +185,66 @@ async def _progressive_scroll(page, timeout_ms: int) -> None:
         await page.wait_for_timeout(250)
 
 
+async def _extract_content_html(page, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
+    script = """
+    () => {
+      const exclusionSelectors = [
+        'header',
+        'nav',
+        'footer',
+        'aside',
+        '[role="navigation"]',
+        '[aria-label*="cookie" i]',
+        '[id*="cookie" i]',
+        '[class*="cookie" i]',
+        '[class*="consent" i]',
+        '[class*="banner" i]',
+      ];
+      const isExcluded = (el) => exclusionSelectors.some((sel) => el.matches(sel));
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') === 0) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const textLength = (el) => ((el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().length);
+      const candidates = [];
+      document.querySelectorAll('main, article, section, div').forEach((el) => {
+        if (!el || isExcluded(el) || !isVisible(el)) return;
+        const len = textLength(el);
+        if (len > 40) {
+          candidates.push({ el, len });
+        }
+      });
+      let target = null;
+      const main = document.querySelector('main');
+      if (main && isVisible(main) && !isExcluded(main)) {
+        target = main;
+      }
+      if (!target && candidates.length) {
+        target = candidates.reduce((max, current) => (current.len > max.len ? current : max)).el;
+      }
+      if (!target) {
+        target = document.body || document.documentElement;
+      }
+      const clone = target.cloneNode(true);
+      const innerRemove = exclusionSelectors.concat([
+        '[class*="menu" i]',
+        '[class*="sidebar" i]',
+        '[class*="nav" i]',
+        '[role="banner"]',
+        '[data-testid*="cookie" i]',
+      ]);
+      innerRemove.forEach((sel) => clone.querySelectorAll(sel).forEach((node) => node.remove()));
+      clone.querySelectorAll('script,style,noscript').forEach((node) => node.remove());
+      return clone.outerHTML;
+    }
+    """
+    return await _safe_evaluate(page, script, timeout_ms=timeout_ms)
+
+
 async def fetch_markdown(
     url: str,
     wait_selectors: Iterable[str] = SHADOW_PROBES,
@@ -178,12 +268,12 @@ async def fetch_markdown(
                     await page.wait_for_selector(selector, state="visible", timeout=2000)
                 except PlaywrightTimeoutError:
                     continue
-            html = await page.content()
+            html = await _extract_content_html(page, timeout_ms=timeout_ms)
             return html_to_markdown(html)
         except Exception as exc:  # noqa: BLE001
             if not html:
                 try:
-                    html = await page.content()
+                    html = await _extract_content_html(page, timeout_ms=timeout_ms)
                 except Exception:  # noqa: BLE001
                     html = ""
             markdown_snapshot = html_to_markdown(html) if html else ""
@@ -193,7 +283,7 @@ async def fetch_markdown(
             await browser.close()
 
 
-def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> DroneBase:
+def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> Tuple[DroneBase, Dict[str, Any]]:
     """Send Markdown to a secondary parsing agent with a semantic mapping prompt."""
 
     prompt = _mapping_prompt(markdown)
@@ -203,15 +293,20 @@ def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> DroneBa
     except json.JSONDecodeError as exc:  # pragma: no cover - defensive
         raise ValueError(f"Parser returned invalid JSON for {url}") from exc
 
+    parser_metadata: Dict[str, Any] = {}
+    if isinstance(payload, dict) and "data" in payload:
+        parser_metadata = payload.get("metadata", {}) or {}
+        payload = payload.get("data", {})
+
     link = payload.get("link") or url
     payload.pop("link", None)
 
     category = payload.get("category", "camera")
     if category == "fpv":
-        return FPVDrone(**payload, link=link)
+        return FPVDrone(**payload, link=link), parser_metadata
     if category == "enterprise":
-        return EnterpriseDrone(**payload, link=link)
-    return CameraDrone(**payload, link=link)
+        return EnterpriseDrone(**payload, link=link), parser_metadata
+    return CameraDrone(**payload, link=link), parser_metadata
 
 
 async def extract_with_self_healing(
@@ -233,6 +328,7 @@ async def extract_with_self_healing(
     errors = []
     markdown = ""
     parsed: Optional[DroneBase] = None
+    parser_metadata: Dict[str, Any] = {}
     total_elapsed_ms = 0
 
     while attempts < max_attempts and parsed is None:
@@ -241,7 +337,7 @@ async def extract_with_self_healing(
         logger.info("crawl.start url=%s attempt=%s", url, attempts)
         try:
             markdown = await fetch_markdown(url, timeout_ms=timeout_ms)
-            parsed = parse_with_agent(markdown, url, parser)
+            parsed, parser_metadata = parse_with_agent(markdown, url, parser)
             attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
             total_elapsed_ms += attempt_elapsed_ms
             logger.info("crawl.success url=%s attempt=%s elapsed_ms=%s", url, attempts, attempt_elapsed_ms)
@@ -284,28 +380,40 @@ async def extract_with_self_healing(
     healed = False
     if missing_core and lookup_strategy:
         for field in missing_core:
-            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.model_dump()})
+            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.dict()})
             if not alt_url:
                 continue
             logger.info("heal.lookup", extra={"field": field, "url": url, "alt_url": alt_url})
             alt_markdown = await fetch_markdown(alt_url)
-            alt_parsed = parse_with_agent(alt_markdown, alt_url, parser)
+            alt_parsed, alt_meta = parse_with_agent(alt_markdown, alt_url, parser)
             if getattr(parsed, field) is None and getattr(alt_parsed, field):
                 setattr(parsed, field, getattr(alt_parsed, field))
                 healed = True
+                parser_metadata.update(alt_meta)
+
+    valid, validation_meta = _validate_result(parsed, url, parser_metadata)
+    combined_metadata = {
+        "healed": healed or bool(missing_core),
+        "missing_fields": missing_core,
+        "attempts": attempts,
+        "errors": errors,
+        "total_elapsed_ms": total_elapsed_ms,
+        "partial": bool(errors),
+        **validation_meta,
+    }
+    if not valid:
+        return CrawlResult(
+            url=url,
+            markdown=markdown,
+            parsed=None,
+            metadata=combined_metadata,
+        )
 
     return CrawlResult(
         url=url,
         markdown=markdown,
         parsed=parsed,
-        metadata={
-            "healed": healed or bool(missing_core),
-            "missing_fields": missing_core,
-            "attempts": attempts,
-            "errors": errors,
-            "total_elapsed_ms": total_elapsed_ms,
-            "partial": bool(errors),
-        },
+        metadata=combined_metadata,
     )
 
 

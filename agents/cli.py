@@ -75,7 +75,7 @@ async def build_dataset(
                 continue
             payload = {
                 "url": url,
-                "data": result.parsed.model_dump(),
+                "data": result.parsed.dict(),
                 "metadata": result.metadata,
             }
             outfile.write(json.dumps(payload) + "\n")
