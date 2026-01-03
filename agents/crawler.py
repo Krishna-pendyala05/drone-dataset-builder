@@ -141,12 +141,15 @@ def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> DroneBa
     raw_response = parser(prompt, url)
     payload = json.loads(raw_response)
 
+    link = payload.get("link") or url
+    payload.pop("link", None)
+
     category = payload.get("category", "camera")
     if category == "fpv":
-        return FPVDrone(**payload, link=url)
+        return FPVDrone(**payload, link=link)
     if category == "enterprise":
-        return EnterpriseDrone(**payload, link=url)
-    return CameraDrone(**payload, link=url)
+        return EnterpriseDrone(**payload, link=link)
+    return CameraDrone(**payload, link=link)
 
 
 async def extract_with_self_healing(

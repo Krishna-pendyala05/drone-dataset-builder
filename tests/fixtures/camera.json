@@ -1,0 +1,8 @@
+{
+  "brand": "SkyCam",
+  "model": "Aero X",
+  "category": "camera",
+  "max_flight_time": 31.0,
+  "sensor_type": "1\" CMOS",
+  "payload_capacity": 0.5
+}

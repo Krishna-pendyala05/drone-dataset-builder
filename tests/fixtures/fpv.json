@@ -1,0 +1,8 @@
+{
+  "brand": "RotorWorks",
+  "model": "Velocity Pro",
+  "category": "fpv",
+  "max_speed": 42.0,
+  "video_tx_power_mw": 800,
+  "supports_hd_link": true
+}

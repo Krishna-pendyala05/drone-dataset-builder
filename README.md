@@ -11,4 +11,10 @@ An AI-augmented ETL pipeline designed to crawl and extract high-fidelity technic
    ```bash
    python -c "from agents.crawler import run_sample; print(run_sample())"
    ```
-3. Integrate with your own parsing agent by passing a `parser(prompt, url) -> JSON string` callable into `extract_with_self_healing`.
+3. Execute the offline parsing flow with the local fixtures and stub parsers:
+   ```bash
+   python -m pytest
+   # or
+   make test
+   ```
+4. Integrate with your own parsing agent by passing a `parser(prompt, url) -> JSON string` callable into `extract_with_self_healing`.

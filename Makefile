@@ -1,0 +1,2 @@
+test:
+\tpython -m pytest
