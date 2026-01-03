@@ -1,0 +1,9 @@
+{
+  "brand": "Hexa Dynamics",
+  "model": "Sentinel XT",
+  "category": "enterprise",
+  "max_flight_time": 45.0,
+  "payload_capacity": 2.5,
+  "ingress_protection": "IP43",
+  "thermal_capability": null
+}
