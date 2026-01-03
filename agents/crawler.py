@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+from time import perf_counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple
 
@@ -175,16 +176,30 @@ async def extract_with_self_healing(
     errors = []
     markdown = ""
     parsed: Optional[DroneBase] = None
+    total_elapsed_ms = 0
 
     while attempts < max_attempts and parsed is None:
         attempts += 1
-        logger.info("crawl.start", extra={"url": url, "attempt": attempts})
+        attempt_start = perf_counter()
+        logger.info("crawl.start url=%s attempt=%s", url, attempts)
         try:
             markdown = await fetch_markdown(url)
             parsed = parse_with_agent(markdown, url, parser)
+            attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
+            total_elapsed_ms += attempt_elapsed_ms
+            logger.info("crawl.success url=%s attempt=%s elapsed_ms=%s", url, attempts, attempt_elapsed_ms)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("crawl.failed", extra={"url": url, "attempt": attempts, "error": str(exc)})
-            errors.append(str(exc))
+            attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
+            total_elapsed_ms += attempt_elapsed_ms
+            error_text = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "crawl.failed url=%s attempt=%s elapsed_ms=%s error=%s",
+                url,
+                attempts,
+                attempt_elapsed_ms,
+                error_text,
+            )
+            errors.append(error_text)
             if attempts >= max_attempts:
                 break
             continue
@@ -194,7 +209,7 @@ async def extract_with_self_healing(
             url=url,
             markdown=markdown,
             parsed=None,
-            metadata={"healed": False, "attempts": attempts, "errors": errors},
+            metadata={"healed": False, "attempts": attempts, "errors": errors, "total_elapsed_ms": total_elapsed_ms},
         )
 
     missing_core = [field for field in ("brand", "model") if not getattr(parsed, field)]
@@ -220,6 +235,7 @@ async def extract_with_self_healing(
             "missing_fields": missing_core,
             "attempts": attempts,
             "errors": errors,
+            "total_elapsed_ms": total_elapsed_ms,
         },
     )
 
