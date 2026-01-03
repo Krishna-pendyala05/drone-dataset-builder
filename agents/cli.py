@@ -46,6 +46,10 @@ async def build_dataset(
     parser = deterministic_parser_factory(llm_mapper=llm_mapper)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     records = 0
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    failed_urls: List[str] = []
 
     with output_path.open("w", encoding="utf-8") as outfile:
         for url in urls:
@@ -56,7 +60,16 @@ async def build_dataset(
                 max_attempts=max_attempts,
             )
             if result.parsed is None:
-                logger.error("crawl.skipped", extra={"url": url, "errors": result.metadata.get("errors")})
+                failed_count += 1
+                skipped_count += 1
+                failed_urls.append(url)
+                logger.error(
+                    "crawl.skipped url=%s attempts=%s elapsed_ms=%s errors=%s",
+                    url,
+                    result.metadata.get("attempts"),
+                    result.metadata.get("total_elapsed_ms"),
+                    result.metadata.get("errors"),
+                )
                 continue
             payload = {
                 "url": url,
@@ -65,9 +78,29 @@ async def build_dataset(
             }
             outfile.write(json.dumps(payload) + "\n")
             records += 1
-            logger.info("crawl.success", extra={"url": url})
+            success_count += 1
+            logger.info(
+                "crawl.success url=%s attempts=%s elapsed_ms=%s",
+                url,
+                result.metadata.get("attempts"),
+                result.metadata.get("total_elapsed_ms"),
+            )
 
-    logger.info("dataset.completed", extra={"output": str(output_path), "records": records})
+    logger.info(
+        "dataset.summary success=%s failed=%s skipped=%s failed_urls=%s",
+        success_count,
+        failed_count,
+        skipped_count,
+        failed_urls,
+    )
+    logger.info(
+        "dataset.completed output=%s records=%s success=%s failed=%s skipped=%s",
+        output_path,
+        records,
+        success_count,
+        failed_count,
+        skipped_count,
+    )
     return output_path
 
 
