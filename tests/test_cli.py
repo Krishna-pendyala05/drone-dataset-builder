@@ -23,10 +23,20 @@ async def test_build_dataset_writes_jsonl(monkeypatch: pytest.MonkeyPatch, tmp_p
         "https://example.com/fpv": (FIXTURE_DIR / "fpv.md").read_text(encoding="utf-8"),
     }
 
-    async def fake_fetch_markdown(url: str, **_kwargs) -> str:
-        return markdown_map[url]
+    async def fake_fetch_snapshot(url: str, **_kwargs) -> crawler.PageSnapshot:
+        markdown_payload = markdown_map[url]
+        return crawler.PageSnapshot(
+            url=url,
+            final_url=url,
+            markdown=markdown_payload,
+            full_html="",
+            pruned_html="",
+            title="",
+            spec_text="",
+            status=200,
+        )
 
-    monkeypatch.setattr(crawler, "fetch_markdown", fake_fetch_markdown)
+    monkeypatch.setattr(crawler, "fetch_snapshot", fake_fetch_snapshot)
 
     await build_dataset(seeds_path=seeds_path, output_path=output_path, llm_mapper=None, max_attempts=1)
 

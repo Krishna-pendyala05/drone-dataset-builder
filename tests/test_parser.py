@@ -102,3 +102,47 @@ def test_parser_requires_units_for_core_metrics() -> None:
     assert canonical["max_speed"] is None
     assert "max speed" in raw_specs
     assert result["metadata"]["quality"] == "B"
+
+
+def test_parser_extracts_raw_specs_from_shadow_text() -> None:
+    spec_text = (FIXTURE_DIR / "dji_shadow.txt").read_text(encoding="utf-8")
+    parser = deterministic_parser_factory()
+
+    payload = {
+        "markdown": "",
+        "full_html": "",
+        "pruned_html": "",
+        "spec_text": spec_text,
+        "title": "DJI Air 3 - Specs | DJI",
+    }
+
+    result = json.loads(parser(payload, "https://www.dji.com/air-3"))
+    raw_specs = result["raw_specs"]
+    canonical = result["canonical"]
+
+    assert raw_specs
+    assert canonical["brand"] == "DJI"
+    assert canonical["model"] == "Air 3"
+    assert canonical["max_flight_time"] == 46
+    assert canonical["max_speed"] == 21
+    assert canonical["sensor_type"]
+    assert result["metadata"]["mapped_from"]["max_flight_time"] == "max flight time"
+
+
+def test_model_extraction_falls_back_from_support_titles() -> None:
+    markdown = "# Support | DJI\n"
+    parser = deterministic_parser_factory()
+
+    payload = {
+        "markdown": markdown,
+        "full_html": "",
+        "pruned_html": "",
+        "spec_text": "",
+        "title": "Support - DJI",
+    }
+
+    result = json.loads(parser(payload, "https://www.dji.com/support/mini-4-pro"))
+    canonical = result["canonical"]
+
+    assert canonical["model"] == "Mini 4 Pro"
+    assert "Support" not in canonical["model"]

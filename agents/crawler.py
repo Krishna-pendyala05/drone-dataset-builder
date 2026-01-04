@@ -34,7 +34,7 @@ else:
         return "\n".join(segment.strip() for segment in html.splitlines() if segment.strip())
 
 
-MarkdownParser = Callable[[str, str], str]
+MarkdownParser = Callable[[Any, str], str]
 SearchStrategy = Callable[[str, Dict[str, Any]], Optional[str]]
 
 
@@ -45,6 +45,36 @@ class CrawlResult:
     parsed: Optional[DroneBase] = None
     raw_specs: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PageSnapshot:
+    url: str
+    final_url: str
+    markdown: str
+    full_html: str
+    pruned_html: str
+    title: str
+    spec_text: str
+    status: Optional[int] = None
+    redirected: bool = False
+    invalid: bool = False
+    invalid_reason: Optional[str] = None
+
+
+@dataclass
+class PageSnapshot:
+    url: str
+    final_url: str
+    markdown: str
+    full_html: str
+    pruned_html: str
+    title: str
+    spec_text: str
+    status: Optional[int] = None
+    redirected: bool = False
+    invalid: bool = False
+    invalid_reason: Optional[str] = None
 
 
 SHADOW_PROBES: Tuple[str, ...] = (
@@ -60,7 +90,7 @@ SHADOW_PROBES: Tuple[str, ...] = (
 def _validate_result(parsed: DroneBase, url: str, parser_metadata: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     meta: Dict[str, Any] = {"parser_metadata": parser_metadata}
     reasons = []
-    fields = parsed.dict()
+    fields = parsed.model_dump()
     host = ""
     try:
         from urllib.parse import urlsplit
@@ -251,58 +281,156 @@ async def _extract_content_html(page, timeout_ms: int = DEFAULT_TIMEOUT_MS) -> s
     return await _safe_evaluate(page, script, timeout_ms=timeout_ms)
 
 
-async def fetch_markdown(
+async def _collect_spec_text(page, timeout_ms: int) -> str:
+    """Extract inner text and Shadow DOM text from custom spec elements."""
+
+    selectors = ["spec", "specs", "specification", "parameters"]
+    script = """
+    (tokens) => {
+      const matches = [];
+      const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+      const crawl = (root) => {
+        const all = root.querySelectorAll("*");
+        all.forEach((el) => {
+          const tag = (el.tagName || "").toLowerCase();
+          const className = (el.className || "").toString().toLowerCase();
+          if (!tag) return;
+          const haystack = `${tag} ${className}`;
+          if (!tokens.some((token) => haystack.includes(token))) return;
+          if (el.shadowRoot) {
+            matches.push({
+              tag,
+              hasShadow: true,
+              text: normalize(el.shadowRoot.innerText || ""),
+              html: el.shadowRoot.innerHTML || "",
+            });
+          } else {
+            matches.push({
+              tag,
+              hasShadow: false,
+              text: normalize(el.innerText || ""),
+              html: el.innerHTML || "",
+            });
+          }
+        });
+      };
+      crawl(document);
+      return matches;
+    }
+    """
+    results = await _safe_evaluate(page, script, selectors, timeout_ms=timeout_ms)
+    texts = []
+    if isinstance(results, list):
+        for item in results:
+            text = ""
+            if isinstance(item, dict):
+                text = item.get("text") or ""
+                html = item.get("html") or ""
+                if html and not text:
+                    text = html
+            if text:
+                texts.append(text)
+    combined = "\n".join(t for t in texts if t)
+    return combined
+
+
+async def fetch_snapshot(
     url: str,
     wait_selectors: Iterable[str] = SHADOW_PROBES,
     viewport: Tuple[int, int] = (1400, 900),
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
-) -> str:
-    """Navigate with Playwright and capture the page as Markdown after deep waits."""
+) -> PageSnapshot:
+    """Navigate with Playwright and capture both full and pruned HTML plus spec text."""
 
     logger = logging.getLogger(__name__)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": viewport[0], "height": viewport[1]})
-        html = ""
+        full_html = ""
+        pruned_html = ""
         page_title = ""
+        spec_text = ""
+        status_code: Optional[int] = None
+        final_url = url
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            if response is not None:
+                status_code = response.status
             await _wait_for_settled(page, timeout_ms=timeout_ms)
+            final_url = page.url
             try:
                 page_title = await page.title()
             except Exception:  # noqa: BLE001
                 page_title = ""
             await _progressive_scroll(page, timeout_ms=timeout_ms)
             await _deep_wait(page, timeout_ms=timeout_ms)
+            spec_text = await _collect_spec_text(page, timeout_ms=timeout_ms)
             for selector in wait_selectors:
                 try:
                     await page.wait_for_selector(selector, state="visible", timeout=2000)
                 except PlaywrightTimeoutError:
                     continue
-            html = await _extract_content_html(page, timeout_ms=timeout_ms)
-            markdown = html_to_markdown(html)
-            if page_title:
-                markdown = f"# {page_title}\n\n{markdown}"
-            return markdown
+            full_html = await page.content()
+            pruned_html = await _extract_content_html(page, timeout_ms=timeout_ms)
         except Exception as exc:  # noqa: BLE001
-            if not html:
-                try:
-                    html = await _extract_content_html(page, timeout_ms=timeout_ms)
-                except Exception:  # noqa: BLE001
-                    html = ""
-            markdown_snapshot = html_to_markdown(html) if html else ""
-            if page_title and markdown_snapshot:
-                markdown_snapshot = f"# {page_title}\n\n{markdown_snapshot}"
             logger.warning("crawl.partial_capture url=%s error=%s", url, exc)
-            raise CrawlContentError(str(exc), markdown_snapshot=markdown_snapshot) from exc
+            if not pruned_html:
+                try:
+                    pruned_html = await _extract_content_html(page, timeout_ms=timeout_ms)
+                except Exception:  # noqa: BLE001
+                    pruned_html = ""
+            if not full_html:
+                try:
+                    full_html = await page.content()
+                except Exception:  # noqa: BLE001
+                    full_html = ""
+            raise CrawlContentError(str(exc), markdown_snapshot=html_to_markdown(pruned_html or full_html)) from exc
         finally:
             await browser.close()
 
+    redirected = final_url.rstrip("/") != url.rstrip("/")
+    invalid = False
+    invalid_reason = None
+    title_lower = (page_title or "").lower()
+    body_text = " ".join(re.sub(r"<[^>]+>", " ", full_html).split()).lower() if full_html else ""
+    if status_code and status_code >= 400:
+        invalid = True
+        invalid_reason = f"status_{status_code}"
+    elif any(token in title_lower for token in ["404", "page not found"]) or any(
+        token in body_text for token in ["404", "page not found"]
+    ):
+        invalid = True
+        invalid_reason = "page_not_found"
 
-def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> Tuple[DroneBase, Dict[str, Any]]:
-    """Send Markdown to a secondary parsing agent with a semantic mapping prompt."""
+    markdown = html_to_markdown(full_html or pruned_html)
+    if page_title:
+        markdown = f"# {page_title}\n\n{markdown}"
 
-    prompt = _mapping_prompt(markdown)
+    return PageSnapshot(
+        url=url,
+        final_url=final_url,
+        markdown=markdown,
+        full_html=full_html,
+        pruned_html=pruned_html,
+        title=page_title,
+        spec_text=spec_text,
+        status=status_code,
+        redirected=redirected,
+        invalid=invalid,
+        invalid_reason=invalid_reason,
+    )
+
+
+def parse_with_agent(snapshot: PageSnapshot, url: str, parser: MarkdownParser) -> Tuple[DroneBase, Dict[str, Any]]:
+    """Send page content to a secondary parsing agent with a semantic mapping prompt."""
+
+    prompt = {
+        "markdown": snapshot.markdown,
+        "full_html": snapshot.full_html,
+        "pruned_html": snapshot.pruned_html,
+        "spec_text": snapshot.spec_text,
+        "title": snapshot.title,
+    }
     raw_response = parser(prompt, url)
     try:
         payload = json.loads(raw_response)
@@ -321,7 +449,7 @@ def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> Tuple[D
         elif "data" in payload:
             payload = payload.get("data", {})
 
-    link = payload.get("link") or url
+    link = payload.get("link") or snapshot.final_url or url
     payload.pop("link", None)
 
     category = payload.get("category", "camera")
@@ -352,15 +480,21 @@ async def extract_with_self_healing(
     markdown = ""
     parsed: Optional[DroneBase] = None
     parser_metadata: Dict[str, Any] = {}
+    raw_specs: Dict[str, Any] = {}
     total_elapsed_ms = 0
 
+    snapshot: Optional[PageSnapshot] = None
     while attempts < max_attempts and parsed is None:
         attempts += 1
         attempt_start = perf_counter()
         logger.info("crawl.start url=%s attempt=%s", url, attempts)
         try:
-            markdown = await fetch_markdown(url, timeout_ms=timeout_ms)
-            parsed, parser_metadata = parse_with_agent(markdown, url, parser)
+            snapshot = await fetch_snapshot(url, timeout_ms=timeout_ms)
+            markdown = snapshot.markdown
+            if snapshot.invalid:
+                errors.append(snapshot.invalid_reason or "invalid_page")
+                break
+            parsed, parser_metadata = parse_with_agent(snapshot, url, parser)
             raw_specs = parser_metadata.pop("raw_specs", {}) if parser_metadata else {}
             attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
             total_elapsed_ms += attempt_elapsed_ms
@@ -386,6 +520,16 @@ async def extract_with_self_healing(
                 break
             continue
 
+    snapshot_meta: Dict[str, Any] = {}
+    if snapshot:
+        snapshot_meta = {
+            "final_url": snapshot.final_url,
+            "redirected": snapshot.redirected,
+            "status": snapshot.status,
+            "invalid": snapshot.invalid,
+            "invalid_reason": snapshot.invalid_reason,
+        }
+
     if parsed is None:
         return CrawlResult(
             url=url,
@@ -398,6 +542,8 @@ async def extract_with_self_healing(
                 "errors": errors,
                 "total_elapsed_ms": total_elapsed_ms,
                 "partial": bool(markdown),
+                **snapshot_meta,
+                "quality": "D" if snapshot and snapshot.invalid else None,
             },
         )
 
@@ -405,12 +551,12 @@ async def extract_with_self_healing(
     healed = False
     if missing_core and lookup_strategy:
         for field in missing_core:
-            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.dict()})
+            alt_url = lookup_strategy(field, {"url": url, "parsed": parsed.model_dump()})
             if not alt_url:
                 continue
             logger.info("heal.lookup", extra={"field": field, "url": url, "alt_url": alt_url})
-            alt_markdown = await fetch_markdown(alt_url)
-            alt_parsed, alt_meta = parse_with_agent(alt_markdown, alt_url, parser)
+            alt_snapshot = await fetch_snapshot(alt_url)
+            alt_parsed, alt_meta = parse_with_agent(alt_snapshot, alt_url, parser)
             if getattr(parsed, field) is None and getattr(alt_parsed, field):
                 setattr(parsed, field, getattr(alt_parsed, field))
                 healed = True
@@ -424,6 +570,7 @@ async def extract_with_self_healing(
         "errors": errors,
         "total_elapsed_ms": total_elapsed_ms,
         "partial": bool(errors),
+        **snapshot_meta,
         **validation_meta,
     }
     if not valid:
@@ -467,7 +614,8 @@ def run_sample():
 __all__ = [
     "DEFAULT_TIMEOUT_MS",
     "CrawlResult",
-    "fetch_markdown",
+    "fetch_snapshot",
+    "PageSnapshot",
     "parse_with_agent",
     "extract_with_self_healing",
     "CrawlContentError",
