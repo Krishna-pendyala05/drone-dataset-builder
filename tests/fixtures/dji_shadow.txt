@@ -1,0 +1,8 @@
+<dji-specs-table>
+Shadow DOM content: 
+Model: Air 3
+Max Flight Time: 46 minutes
+Max Speed: 21 m/s
+Image Sensor: 1/1.3" CMOS
+Brand: DJI
+</dji-specs-table>

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit
 
+from bs4 import BeautifulSoup
 from config.schemas import CameraDrone, DroneBase, EnterpriseDrone, FPVDrone
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,14 @@ SECTION_KEYWORDS = [
     "gimbal",
     "transmission",
 ]
+
+# Optional Markdown conversion helper mirroring crawler behavior.
+markdownify_spec = importlib.util.find_spec("markdownify")
+if markdownify_spec:
+    from markdownify import markdownify as html_to_markdown  # type: ignore
+else:  # pragma: no cover - lightweight fallback
+    def html_to_markdown(html: str) -> str:
+        return "\n".join(segment.strip() for segment in html.splitlines() if segment.strip())
 
 
 def _normalize_key(raw: str) -> Optional[str]:
@@ -244,6 +254,31 @@ def _parse_key_values(lines: Iterable[str]) -> List[Tuple[str, str, str]]:
     return kv
 
 
+def _parse_html_structured(html: str) -> List[Tuple[str, str, str]]:
+    entries: List[Tuple[str, str, str]] = []
+    if not html:
+        return entries
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            raw_key = cells[0].get_text(separator=" ", strip=True)
+            raw_val = cells[1].get_text(separator=" ", strip=True)
+            if raw_key and raw_val:
+                entries.append((raw_key, raw_val, f"{raw_key}: {raw_val}"))
+    for dl in soup.find_all("dl"):
+        dts = dl.find_all("dt")
+        dds = dl.find_all("dd")
+        for idx, dt in enumerate(dts):
+            raw_key = dt.get_text(separator=" ", strip=True)
+            raw_val = dds[idx].get_text(separator=" ", strip=True) if idx < len(dds) else ""
+            if raw_key and raw_val:
+                entries.append((raw_key, raw_val, f"{raw_key}: {raw_val}"))
+    return entries
+
+
 def _collapse_tables(tables: List[Dict[str, str]]) -> List[Tuple[str, str, str]]:
     entries: List[Tuple[str, str, str]] = []
     for row in tables:
@@ -273,7 +308,7 @@ def _filter_lines(lines: List[str]) -> List[str]:
     return filtered
 
 
-def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
+def _select_spec_section(markdown: str, fallback_markdown: Optional[str] = None) -> Tuple[List[str], Dict[str, object]]:
     lines = [line for line in markdown.splitlines()]
     sections: List[Tuple[int, str]] = []
     for idx, line in enumerate(lines):
@@ -290,6 +325,8 @@ def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
             if "#spec" in line.lower() or "anchor=\"spec" in line.lower():
                 spec_indices.append(idx)
                 break
+    if not spec_indices and fallback_markdown:
+        return _select_spec_section(fallback_markdown, None)
     if not spec_indices:
         return _filter_lines(lines), {"spec_section_found": False, "section_title": None}
     spec_indices_sorted = sorted(spec_indices)
@@ -443,24 +480,24 @@ def _clean_model_candidate(candidate: str, brand_prefix: str = "") -> Optional[s
     lowered = cleaned.lower()
     if re.fullmatch(r"#+", cleaned):
         return None
-    if "customer service" in lowered:
+    if any(token in lowered for token in ["customer service", "support", "404", "page not found"]):
         return None
     if re.search(r"(https?:|//)", cleaned):
         return None
     if brand_prefix and cleaned.lower().startswith(brand_prefix.lower()):
         cleaned = cleaned[len(brand_prefix) :].strip(" -|")
-    cleaned = re.sub(r"\s*-\s*specs?\s*\|?\s*dji", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*-\s*specs?\b.*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*\|\s*dji", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip()
     return cleaned or None
 
 
-def _derive_identity(fields: Dict[str, object], markdown: str, url: str) -> None:
+def _derive_identity(fields: Dict[str, object], markdown: str, url: str, page_title: Optional[str] = None) -> None:
     url_host = urlsplit(url).netloc.lower()
     if "dji.com" in url_host:
         fields["brand"] = "DJI"
     heading_match = re.search(r"^#\s*(.+)$", markdown, flags=re.MULTILINE)
-    page_title = heading_match.group(1).strip() if heading_match else None
+    page_title = page_title or (heading_match.group(1).strip() if heading_match else None)
     h1_match = re.search(r"^#+\s*(.+)$", markdown, flags=re.MULTILINE)
     heading_candidate = h1_match.group(1).strip() if h1_match else None
     path_parts = [part for part in urlsplit(url).path.split("/") if part]
@@ -502,17 +539,42 @@ def _grade_quality(canonical_fields: Dict[str, object], raw_specs: Dict[str, Dic
 
 def deterministic_parser_factory(
     llm_mapper: Optional[Callable[[Dict[str, object], str, str], Dict[str, object]]] = None,
-) -> Callable[[str, str], str]:
-    def parser(prompt: str, url: str) -> str:
-        markdown = _extract_markdown(prompt)
-        spec_lines, section_info = _select_spec_section(markdown)
+) -> Callable[[Any, str], str]:
+    def parser(payload: object, url: str) -> str:
+        spec_text = ""
+        full_html = ""
+        pruned_html = ""
+        page_title = None
+        if isinstance(payload, dict):
+            markdown = payload.get("markdown") or ""
+            full_html = payload.get("full_html") or ""
+            pruned_html = payload.get("pruned_html") or ""
+            spec_text = payload.get("spec_text") or ""
+            page_title = payload.get("title")
+            if not markdown and full_html:
+                markdown = html_to_markdown(full_html)
+                if page_title:
+                    markdown = f"# {page_title}\n\n{markdown}"
+            fallback_markdown = html_to_markdown(pruned_html) if pruned_html else None
+        else:
+            markdown = _extract_markdown(str(payload))
+            fallback_markdown = None
+        spec_lines: List[str] = []
+        section_info: Dict[str, object] = {"spec_section_found": False, "section_title": None}
+        if spec_text and len(spec_text) > 2000:
+            spec_lines = _filter_lines(spec_text.splitlines())
+            section_info = {"spec_section_found": True, "section_title": "spec_text"}
+        else:
+            spec_lines, section_info = _select_spec_section(markdown, fallback_markdown)
         tables = _parse_table(spec_lines)
         table_entries = _collapse_tables(tables)
         kv_entries = _parse_key_values(spec_lines)
-        entries = table_entries + kv_entries
+        html_entries = _parse_html_structured(full_html or pruned_html)
+        spec_entries = _parse_key_values(spec_text.splitlines()) if spec_text else []
+        entries = spec_entries + html_entries + table_entries + kv_entries
         raw_specs = _collect_raw_specs(entries)
         fields, unmapped, mapped_from = _map_fields(raw_specs)
-        _derive_identity(fields, markdown, url)
+        _derive_identity(fields, markdown, url, page_title=page_title)
         if llm_mapper:
             try:
                 mapped = llm_mapper(fields, markdown, url)
@@ -521,7 +583,7 @@ def deterministic_parser_factory(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM mapper failed; continuing with deterministic fields", exc_info=exc)
         drone = _to_schema(fields)
-        canonical_fields = drone.dict()
+        canonical_fields = drone.model_dump()
         canonical_count = sum(1 for key, value in canonical_fields.items() if value not in (None, ""))
         quality = _grade_quality(canonical_fields, raw_specs, canonical_count)
         metadata = {
