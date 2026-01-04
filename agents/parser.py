@@ -76,6 +76,17 @@ IDENTITY_KEYS: Dict[str, str] = {
 }
 
 MIN_FIELD_COUNT = 5
+SECTION_KEYWORDS = [
+    "spec",
+    "specification",
+    "technical",
+    "parameters",
+    "details",
+    "aircraft",
+    "camera",
+    "gimbal",
+    "transmission",
+]
 
 
 def _normalize_key(raw: str) -> Optional[str]:
@@ -88,6 +99,15 @@ def _normalize_key(raw: str) -> Optional[str]:
     if normalized in {"brand", "model"}:
         return cleaned
     return None
+
+
+def _normalize_raw_key(raw: str) -> Optional[str]:
+    cleaned = raw.strip().strip(":")
+    if not cleaned:
+        return None
+    cleaned = re.sub(r"[\\*`]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.lower()
 
 
 def _normalize_placeholder(value: object) -> Optional[object]:
@@ -123,6 +143,46 @@ def _coerce_bool(value: str) -> Optional[bool]:
     if lowered in {"no", "false", "n", "0", "not included", "optional"}:
         return False
     return None
+
+
+def _parse_minutes(value: str) -> Optional[float]:
+    lowered = value.lower()
+    if "min" not in lowered and "minute" not in lowered:
+        return None
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)", lowered.replace(",", ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _parse_speed(value: str) -> Optional[float]:
+    lowered = value.lower()
+    number_match = None
+    if "m/s" in lowered or "meter/second" in lowered:
+        number_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:m/s|meter/second)", lowered)
+        if number_match:
+            return float(number_match.group(1))
+    if any(unit in lowered for unit in ["km/h", "kph", "kmh"]):
+        number_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:km/h|kph|kmh)", lowered)
+        if number_match:
+            return float(number_match.group(1)) / 3.6
+    return None
+
+
+def _looks_like_sensor(value: str) -> bool:
+    lowered = value.lower()
+    if "cmos" in lowered or "ccd" in lowered:
+        return True
+    if "effective pixel" in lowered:
+        return True
+    if re.search(r"[0-9]+/[0-9.]+\s*(?:inch|in)", lowered):
+        return True
+    if re.search(r"[0-9.]+\s*inch", lowered):
+        return True
+    return False
 
 
 def _maybe_category(fields: Dict[str, object], markdown: str) -> str:
@@ -167,8 +227,8 @@ def _parse_table(lines: List[str]) -> List[Dict[str, str]]:
     return tables
 
 
-def _parse_key_values(lines: Iterable[str]) -> Dict[str, str]:
-    kv: Dict[str, str] = {}
+def _parse_key_values(lines: Iterable[str]) -> List[Tuple[str, str, str]]:
+    kv: List[Tuple[str, str, str]] = []
     patterns = [
         re.compile(r"^\s*[-*]\s*([^:]+):\s*(.+)$"),
         re.compile(r"^\s*([^:]{2,}):\s*(.+)$"),
@@ -179,27 +239,23 @@ def _parse_key_values(lines: Iterable[str]) -> Dict[str, str]:
             if match:
                 key, value = match.group(1).strip(" *`"), match.group(2).strip()
                 value = value.lstrip("* ").strip()
-                kv[key] = value
+                kv.append((key, value, line.strip()))
                 break
     return kv
 
 
-def _collapse_tables(tables: List[Dict[str, str]]) -> Dict[str, str]:
-    kv: Dict[str, str] = {}
+def _collapse_tables(tables: List[Dict[str, str]]) -> List[Tuple[str, str, str]]:
+    entries: List[Tuple[str, str, str]] = []
     for row in tables:
         if len(row) == 2:
             first_key, second_key = list(row.keys())
             raw_key_candidate = row[first_key]
             raw_value_candidate = row[second_key]
-            normalized_key = _normalize_key(raw_key_candidate)
-            if normalized_key:
-                kv.setdefault(normalized_key, raw_value_candidate)
-                continue
+            entries.append((raw_key_candidate, raw_value_candidate, f"{raw_key_candidate}: {raw_value_candidate}"))
+            continue
         for key, value in row.items():
-            normalized_key = _normalize_key(key)
-            if normalized_key:
-                kv.setdefault(normalized_key, value)
-    return kv
+            entries.append((key, value, f"{key}: {value}"))
+    return entries
 
 
 def _filter_lines(lines: List[str]) -> List[str]:
@@ -227,7 +283,7 @@ def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
     spec_indices: List[int] = []
     for idx, title in sections:
         lowered = title.lower()
-        if "spec" in lowered:
+        if any(keyword in lowered for keyword in SECTION_KEYWORDS):
             spec_indices.append(idx)
     if not spec_indices:
         for idx, line in enumerate(lines):
@@ -236,7 +292,11 @@ def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
                 break
     if not spec_indices:
         return _filter_lines(lines), {"spec_section_found": False, "section_title": None}
-    start = min(spec_indices)
+    spec_indices_sorted = sorted(spec_indices)
+    if 0 in spec_indices_sorted and len(spec_indices_sorted) > 1:
+        start = spec_indices_sorted[1]
+    else:
+        start = spec_indices_sorted[0]
     next_headings = [idx for idx, _ in sections if idx > start]
     end = min(next_headings) if next_headings else len(lines)
     return _filter_lines(lines[start:end]), {
@@ -245,32 +305,154 @@ def _select_spec_section(markdown: str) -> Tuple[List[str], Dict[str, object]]:
     }
 
 
-def _map_fields(kv: Dict[str, str]) -> Tuple[Dict[str, object], Dict[str, str]]:
+def _collect_raw_specs(entries: List[Tuple[str, str, str]]) -> Dict[str, Dict[str, str]]:
+    raw_specs: Dict[str, Dict[str, str]] = {}
+    for raw_key, raw_val, evidence in entries:
+        normalized_key = _normalize_raw_key(raw_key or "")
+        if not normalized_key:
+            continue
+        raw_specs.setdefault(
+            normalized_key,
+            {
+                "value": raw_val,
+                "evidence": evidence,
+                "raw_key": raw_key,
+            },
+        )
+    return raw_specs
+
+
+def _canonical_field_from_key(raw_key: str) -> Optional[str]:
+    key = raw_key.lower()
+    key = re.sub(r"\s+", " ", key)
+    if any(token in key for token in ["flight time", "endurance", "hover time", "maximum flight time"]):
+        return "max_flight_time"
+    if any(token in key for token in ["max speed", "top speed", "speed"]):
+        return "max_speed"
+    if any(token in key for token in ["sensor", "camera sensor", "sensor type", "image sensor", "imager", "effective pixel"]):
+        return "sensor_type"
+    if any(token in key for token in ["payload", "payload capacity", "max payload", "payload weight", "maximum payload"]):
+        return "payload_capacity"
+    if "gimbal" in key:
+        return "gimbal"
+    if any(token in key for token in ["video tx power", "vtx power", "video transmitter power"]):
+        return "video_tx_power_mw"
+    if any(token in key for token in ["hd link", "digital link"]):
+        return "supports_hd_link"
+    if any(token in key for token in ["ingress protection", "ip rating"]):
+        return "ingress_protection"
+    if "thermal" in key:
+        return "thermal_capability"
+    if "operating temperature" in key:
+        return "operating_temp_c"
+    return None
+
+
+def _map_fields(raw_specs: Dict[str, Dict[str, str]]) -> Tuple[Dict[str, object], Dict[str, str], Dict[str, str]]:
     fields: Dict[str, object] = {}
     unmapped: Dict[str, str] = {}
-    for raw_key, raw_val in kv.items():
-        normalized_key = _normalize_key(raw_key)
-        normalized_value = _normalize_placeholder(raw_val)
-        if normalized_key is None or normalized_value is None:
-            if raw_key.strip():
-                unmapped[raw_key.strip()] = raw_val
+    mapped_from: Dict[str, str] = {}
+
+    for normalized_key, entry in raw_specs.items():
+        raw_key = entry.get("raw_key") or normalized_key
+        value = entry.get("value")
+        if value is None:
             continue
-        if isinstance(normalized_value, str) and re.search(r"(https?:|www\\.|//)", normalized_value, re.IGNORECASE):
-            if normalized_key != "link":
-                unmapped[raw_key.strip()] = raw_val
-                continue
-        if normalized_key in {"max_flight_time", "payload_capacity", "max_speed"}:
-            number = _coerce_number(normalized_value)
-            fields[normalized_key] = number
-        elif normalized_key in {"gimbal", "supports_hd_link", "thermal_capability"}:
-            bool_val = _coerce_bool(normalized_value if isinstance(normalized_value, str) else str(normalized_value))
-            fields[normalized_key] = bool_val if bool_val is not None else _normalize_placeholder(normalized_value)
-        elif normalized_key in {"video_tx_power_mw"}:
-            num = _coerce_number(normalized_value)
-            fields[normalized_key] = int(num) if num is not None else _normalize_placeholder(normalized_value)
+        normalized_value = _normalize_placeholder(value)
+        if normalized_value is None:
+            continue
+        identity_key = _normalize_key(raw_key or "")
+        if identity_key in {"brand", "model"}:
+            fields.setdefault(identity_key, str(normalized_value).strip())
+            mapped_from[identity_key] = normalized_key
+            continue
+        canonical_key = _canonical_field_from_key(raw_key)
+        text_value = str(normalized_value)
+        if canonical_key == "max_flight_time":
+            minutes = _parse_minutes(text_value)
+            if minutes is not None:
+                fields["max_flight_time"] = minutes
+                mapped_from["max_flight_time"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "max_speed":
+            speed_ms = _parse_speed(text_value)
+            if speed_ms is not None:
+                fields["max_speed"] = speed_ms
+                mapped_from["max_speed"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "sensor_type":
+            if _looks_like_sensor(text_value):
+                fields["sensor_type"] = text_value.strip()
+                mapped_from["sensor_type"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "payload_capacity":
+            weight = _coerce_number(text_value)
+            if weight is not None:
+                fields["payload_capacity"] = weight
+                mapped_from["payload_capacity"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "gimbal":
+            bool_val = _coerce_bool(text_value)
+            if bool_val is not None:
+                fields["gimbal"] = bool_val
+                mapped_from["gimbal"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "video_tx_power_mw":
+            num = _coerce_number(text_value)
+            if num is not None:
+                fields["video_tx_power_mw"] = int(num)
+                mapped_from["video_tx_power_mw"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "supports_hd_link":
+            bool_val = _coerce_bool(text_value)
+            if bool_val is not None:
+                fields["supports_hd_link"] = bool_val
+                mapped_from["supports_hd_link"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "ingress_protection":
+            fields["ingress_protection"] = text_value.strip()
+            mapped_from["ingress_protection"] = normalized_key
+        elif canonical_key == "thermal_capability":
+            bool_val = _coerce_bool(text_value)
+            if bool_val is not None:
+                fields["thermal_capability"] = bool_val
+                mapped_from["thermal_capability"] = normalized_key
+            else:
+                unmapped[raw_key] = value
+        elif canonical_key == "operating_temp_c":
+            fields["operating_temp_c"] = text_value.strip()
+            mapped_from["operating_temp_c"] = normalized_key
         else:
-            fields[normalized_key] = _normalize_placeholder(normalized_value)
-    return fields, unmapped
+            unmapped[raw_key] = value
+
+    return fields, unmapped, mapped_from
+
+
+def _clean_model_candidate(candidate: str, brand_prefix: str = "") -> Optional[str]:
+    cleaned = candidate.strip().strip("|").strip("-")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    if not cleaned:
+        return None
+    lowered = cleaned.lower()
+    if re.fullmatch(r"#+", cleaned):
+        return None
+    if "customer service" in lowered:
+        return None
+    if re.search(r"(https?:|//)", cleaned):
+        return None
+    if brand_prefix and cleaned.lower().startswith(brand_prefix.lower()):
+        cleaned = cleaned[len(brand_prefix) :].strip(" -|")
+    cleaned = re.sub(r"\s*-\s*specs?\s*\|?\s*dji", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*\|\s*dji", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+    return cleaned or None
 
 
 def _derive_identity(fields: Dict[str, object], markdown: str, url: str) -> None:
@@ -278,27 +460,44 @@ def _derive_identity(fields: Dict[str, object], markdown: str, url: str) -> None
     if "dji.com" in url_host:
         fields["brand"] = "DJI"
     heading_match = re.search(r"^#\s*(.+)$", markdown, flags=re.MULTILINE)
-    title = heading_match.group(1).strip() if heading_match else None
-    if not title:
-        secondary_heading = re.search(r"^##\s*(.+)$", markdown, flags=re.MULTILINE)
-        if secondary_heading:
-            title = secondary_heading.group(1).strip()
-    if title and "spec" not in title.lower():
-        brand_prefix = str(fields.get("brand", "") or "")
-        model_candidate = title
-        if brand_prefix and model_candidate.lower().startswith(brand_prefix.lower()):
-            model_candidate = model_candidate[len(brand_prefix) :].strip(" -|")
+    page_title = heading_match.group(1).strip() if heading_match else None
+    h1_match = re.search(r"^#+\s*(.+)$", markdown, flags=re.MULTILINE)
+    heading_candidate = h1_match.group(1).strip() if h1_match else None
+    path_parts = [part for part in urlsplit(url).path.split("/") if part]
+    slug = path_parts[-1] if path_parts else ""
+    normalized_slug = slug.replace("-", " ").replace("_", " ").strip()
+    slug_candidate = " ".join(word.upper() if word.isupper() else word.capitalize() for word in normalized_slug.split())
+
+    brand_prefix = str(fields.get("brand", "") or "")
+    for candidate in (page_title, heading_candidate, slug_candidate):
+        model_candidate = _clean_model_candidate(candidate or "", brand_prefix=brand_prefix)
         if model_candidate:
             fields.setdefault("model", model_candidate)
-    if "model" not in fields or not fields["model"]:
-        path_parts = [part for part in urlsplit(url).path.split("/") if part]
-        slug = path_parts[-1] if path_parts else ""
-        normalized_slug = slug.replace("-", " ").replace("_", " ").strip()
-        if normalized_slug:
-            words = [word.upper() if word.isupper() else word.capitalize() for word in normalized_slug.split()]
-            fields.setdefault("model", " ".join(words))
+            break
     fields["category"] = _maybe_category(fields, markdown)
     fields.setdefault("link", url)
+
+
+def _grade_quality(canonical_fields: Dict[str, object], raw_specs: Dict[str, Dict[str, str]], canonical_count: int) -> str:
+    brand_valid = bool(canonical_fields.get("brand"))
+    model_valid = bool(canonical_fields.get("model"))
+    raw_present = bool(raw_specs)
+    # Exclude identity/link/category from canonical count for grading.
+    canonical_metrics = {
+        key: value
+        for key, value in canonical_fields.items()
+        if key not in {"brand", "model", "category", "link"} and value not in (None, "")
+    }
+    metric_count = len(canonical_metrics)
+    if brand_valid and model_valid and metric_count >= 3:
+        return "A"
+    if brand_valid and model_valid and metric_count >= 1:
+        return "B"
+    if model_valid and raw_present:
+        return "C"
+    if not model_valid and not raw_present:
+        return "D"
+    return "C"
 
 
 def deterministic_parser_factory(
@@ -308,9 +507,11 @@ def deterministic_parser_factory(
         markdown = _extract_markdown(prompt)
         spec_lines, section_info = _select_spec_section(markdown)
         tables = _parse_table(spec_lines)
-        table_kv = _collapse_tables(tables)
-        kv = {**table_kv, **_parse_key_values(spec_lines)}
-        fields, unmapped = _map_fields(kv)
+        table_entries = _collapse_tables(tables)
+        kv_entries = _parse_key_values(spec_lines)
+        entries = table_entries + kv_entries
+        raw_specs = _collect_raw_specs(entries)
+        fields, unmapped, mapped_from = _map_fields(raw_specs)
         _derive_identity(fields, markdown, url)
         if llm_mapper:
             try:
@@ -320,12 +521,25 @@ def deterministic_parser_factory(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("LLM mapper failed; continuing with deterministic fields", exc_info=exc)
         drone = _to_schema(fields)
+        canonical_fields = drone.dict()
+        canonical_count = sum(1 for key, value in canonical_fields.items() if value not in (None, ""))
+        quality = _grade_quality(canonical_fields, raw_specs, canonical_count)
         metadata = {
             "unmapped_specs": unmapped,
             "mapped_fields": sorted([key for key, value in fields.items() if value is not None]),
+            "mapped_from": mapped_from,
+            "raw_specs_count": len(raw_specs),
+            "canonical_field_count": canonical_count,
+            "quality": quality,
             **section_info,
         }
-        return json.dumps({"data": drone.dict(), "metadata": metadata})
+        payload = {
+            "canonical": canonical_fields,
+            "data": canonical_fields,  # backward compatibility alias
+            "raw_specs": raw_specs,
+            "metadata": metadata,
+        }
+        return json.dumps(payload)
 
     return parser
 
