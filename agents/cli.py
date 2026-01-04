@@ -73,9 +73,12 @@ async def build_dataset(
                     result.metadata.get("errors"),
                 )
                 continue
+            canonical = result.parsed.dict()
             payload = {
                 "url": url,
-                "data": result.parsed.dict(),
+                "data": canonical,
+                "canonical": canonical,
+                "raw_specs": result.raw_specs,
                 "metadata": result.metadata,
             }
             outfile.write(json.dumps(payload) + "\n")

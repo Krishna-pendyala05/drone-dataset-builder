@@ -43,6 +43,7 @@ class CrawlResult:
     url: str
     markdown: str
     parsed: Optional[DroneBase] = None
+    raw_specs: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -74,14 +75,19 @@ def _validate_result(parsed: DroneBase, url: str, parser_metadata: Dict[str, Any
         reasons.append("invalid_model")
     field_count = sum(1 for _, value in fields.items() if value not in (None, ""))
     meta["field_count"] = field_count
-    if field_count < MIN_FIELD_COUNT:
-        reasons.append("insufficient_fields")
-    if fields.get("max_flight_time") is None and fields.get("max_speed") is None:
-        reasons.append("missing_core_metrics")
-    if reasons:
+    raw_specs = parser_metadata.get("raw_specs") or {}
+    quality = parser_metadata.get("quality")
+    meta["quality"] = quality
+    if quality == "D" or (not raw_specs and not model.strip()):
+        meta["invalid"] = True
+        meta["reason"] = ";".join(reasons) if reasons else "insufficient_data"
+        return False, meta
+    if "invalid_model" in reasons and not raw_specs:
         meta["invalid"] = True
         meta["reason"] = ";".join(reasons)
         return False, meta
+    if reasons:
+        meta["reason"] = ";".join(reasons)
     return True, meta
 
 
@@ -258,9 +264,14 @@ async def fetch_markdown(
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": viewport[0], "height": viewport[1]})
         html = ""
+        page_title = ""
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             await _wait_for_settled(page, timeout_ms=timeout_ms)
+            try:
+                page_title = await page.title()
+            except Exception:  # noqa: BLE001
+                page_title = ""
             await _progressive_scroll(page, timeout_ms=timeout_ms)
             await _deep_wait(page, timeout_ms=timeout_ms)
             for selector in wait_selectors:
@@ -269,7 +280,10 @@ async def fetch_markdown(
                 except PlaywrightTimeoutError:
                     continue
             html = await _extract_content_html(page, timeout_ms=timeout_ms)
-            return html_to_markdown(html)
+            markdown = html_to_markdown(html)
+            if page_title:
+                markdown = f"# {page_title}\n\n{markdown}"
+            return markdown
         except Exception as exc:  # noqa: BLE001
             if not html:
                 try:
@@ -277,6 +291,8 @@ async def fetch_markdown(
                 except Exception:  # noqa: BLE001
                     html = ""
             markdown_snapshot = html_to_markdown(html) if html else ""
+            if page_title and markdown_snapshot:
+                markdown_snapshot = f"# {page_title}\n\n{markdown_snapshot}"
             logger.warning("crawl.partial_capture url=%s error=%s", url, exc)
             raise CrawlContentError(str(exc), markdown_snapshot=markdown_snapshot) from exc
         finally:
@@ -294,9 +310,16 @@ def parse_with_agent(markdown: str, url: str, parser: MarkdownParser) -> Tuple[D
         raise ValueError(f"Parser returned invalid JSON for {url}") from exc
 
     parser_metadata: Dict[str, Any] = {}
-    if isinstance(payload, dict) and "data" in payload:
+    raw_specs: Dict[str, Any] = {}
+    if isinstance(payload, dict):
         parser_metadata = payload.get("metadata", {}) or {}
-        payload = payload.get("data", {})
+        raw_specs = payload.get("raw_specs")
+        if raw_specs is not None:
+            parser_metadata["raw_specs"] = raw_specs
+        if "canonical" in payload:
+            payload = payload.get("canonical", {})
+        elif "data" in payload:
+            payload = payload.get("data", {})
 
     link = payload.get("link") or url
     payload.pop("link", None)
@@ -338,6 +361,7 @@ async def extract_with_self_healing(
         try:
             markdown = await fetch_markdown(url, timeout_ms=timeout_ms)
             parsed, parser_metadata = parse_with_agent(markdown, url, parser)
+            raw_specs = parser_metadata.pop("raw_specs", {}) if parser_metadata else {}
             attempt_elapsed_ms = int((perf_counter() - attempt_start) * 1000)
             total_elapsed_ms += attempt_elapsed_ms
             logger.info("crawl.success url=%s attempt=%s elapsed_ms=%s", url, attempts, attempt_elapsed_ms)
@@ -367,6 +391,7 @@ async def extract_with_self_healing(
             url=url,
             markdown=markdown,
             parsed=None,
+            raw_specs=raw_specs,
             metadata={
                 "healed": False,
                 "attempts": attempts,
@@ -391,7 +416,7 @@ async def extract_with_self_healing(
                 healed = True
                 parser_metadata.update(alt_meta)
 
-    valid, validation_meta = _validate_result(parsed, url, parser_metadata)
+    valid, validation_meta = _validate_result(parsed, url, {**parser_metadata, "raw_specs": raw_specs})
     combined_metadata = {
         "healed": healed or bool(missing_core),
         "missing_fields": missing_core,
@@ -406,6 +431,7 @@ async def extract_with_self_healing(
             url=url,
             markdown=markdown,
             parsed=None,
+            raw_specs=raw_specs,
             metadata=combined_metadata,
         )
 
@@ -413,6 +439,7 @@ async def extract_with_self_healing(
         url=url,
         markdown=markdown,
         parsed=parsed,
+        raw_specs=raw_specs,
         metadata=combined_metadata,
     )
 
